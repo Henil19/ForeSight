@@ -117,7 +117,7 @@ The forecast date is a Monday–Friday weekday approximation. Exchange holidays 
 
 ## Current Results
 
-The following values are from the results currently stored in `outputs/`. They describe one run and are not guarantees of future performance.
+The numerical results below correspond to the verified run used for this README. They describe one run and are not guarantees of future performance. The application continues to write generated result files to `outputs/` when it runs.
 
 ### Holdout Comparison
 
@@ -140,6 +140,16 @@ The following values are from the results currently stored in `outputs/`. They d
 In this run, the naive baseline has the lowest mean walk-forward RMSE. Linear Regression is the best trained ML model by mean walk-forward RMSE. The target-scaled MLP improved substantially over the raw-target MLP in the controlled experiment, but remains behind the naive baseline and Linear Regression in these results. Random Forest performs worse than those two approaches in the reported comparisons. The results do not show that the ML models outperform the naive baseline overall.
 
 The stored example forecast is for AAPL: Linear Regression was selected, with a predicted close of **$336.80** and an approximated forecast date of **2026-10-12**. This is a run-specific result, not a prediction guarantee.
+
+## Visual Results
+
+The selected charts below are included in `assets/` for README display. Running the application continues to generate these plots under `outputs/`.
+
+![Historical closing price](assets/historical_close.png)
+
+![Technical indicators](assets/technical_indicators.png)
+
+![Model predictions](assets/model_predictions.png)
 
 ## Generated Outputs
 
