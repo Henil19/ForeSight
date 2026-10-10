@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 import numpy as np
 import pandas as pd
+from sklearn.base import clone
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
@@ -116,3 +117,101 @@ def calculate_baseline_improvement(
     }
 
 
+def walk_forward_validate(
+    models: Mapping[str, Any],
+    X: pd.DataFrame,
+    y: pd.Series,
+    previous_close: pd.Series,
+    n_splits: int = 5,
+    min_train_size: int | None = None,
+) -> pd.DataFrame:
+    """Evaluate models with chronological, expanding-window validation.
+
+    The input order is used as-is and must already be chronological. Each test
+    window follows its training window; training expands to include all earlier
+    observations. Fresh clones are fitted independently in each split.
+    """
+    if not isinstance(X, pd.DataFrame):
+        raise TypeError("X must be a pandas DataFrame.")
+    if not isinstance(y, pd.Series) or not isinstance(previous_close, pd.Series):
+        raise TypeError("y and previous_close must be pandas Series.")
+    if X.empty or y.empty or previous_close.empty:
+        raise ValueError("X, y, and previous_close must be non-empty.")
+    if not X.index.equals(y.index) or not X.index.equals(previous_close.index):
+        raise ValueError("X, y, and previous_close must have identical indexes.")
+    if not X.index.is_monotonic_increasing or X.index.has_duplicates:
+        raise ValueError("Input indexes must be unique and already chronologically ordered.")
+    if isinstance(n_splits, bool) or not isinstance(n_splits, (int, np.integer)) or n_splits < 1:
+        raise ValueError("n_splits must be a positive integer.")
+
+    row_count = len(X)
+    if min_train_size is None:
+        min_train_size = max(2, row_count // (n_splits + 1))
+    elif (
+        isinstance(min_train_size, bool)
+        or not isinstance(min_train_size, (int, np.integer))
+        or min_train_size < 2
+    ):
+        raise ValueError("min_train_size must be an integer of at least 2.")
+    if min_train_size >= row_count:
+        raise ValueError("min_train_size must be smaller than the dataset size.")
+    if row_count - min_train_size < 2 * n_splits:
+        raise ValueError(
+            "Dataset and min_train_size cannot produce the requested splits "
+            "with at least two test observations per split."
+        )
+
+    test_windows = np.array_split(np.arange(min_train_size, row_count), n_splits)
+    rows: list[dict[str, Any]] = []
+    for split_number, test_positions in enumerate(test_windows, start=1):
+        test_start = int(test_positions[0])
+        test_stop = int(test_positions[-1]) + 1
+        train_X = X.iloc[:test_start]
+        train_y = y.iloc[:test_start]
+        test_X = X.iloc[test_start:test_stop]
+        test_y = y.iloc[test_start:test_stop]
+        test_previous_close = previous_close.iloc[test_start:test_stop]
+
+        if not train_X.index[-1] < test_X.index[0]:
+            raise ValueError("Each test window must occur strictly after its training window.")
+
+        for name, model in models.items():
+            fitted_model = clone(model)
+            fitted_model.fit(train_X, train_y)
+            rows.append({
+                "Split": split_number,
+                "Model": name,
+                **evaluate_model(fitted_model, test_X, test_y, test_previous_close),
+            })
+        rows.append({
+            "Split": split_number,
+            "Model": "Naive Baseline",
+            **evaluate_naive_baseline(test_y, test_previous_close),
+        })
+
+    return pd.DataFrame(
+        rows,
+        columns=["Split", "Model", "MAE", "RMSE", "R2", "Directional_Accuracy"],
+    )
+
+
+def summarize_walk_forward_results(results: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate walk-forward metrics by model and sort by mean RMSE."""
+    required = {"Model", "MAE", "RMSE", "R2", "Directional_Accuracy"}
+    missing = sorted(required.difference(results.columns))
+    if missing:
+        raise ValueError("Walk-forward results are missing required columns: " + ", ".join(missing))
+    if results.empty:
+        raise ValueError("Walk-forward results must contain at least one row.")
+    summary = (
+        results.groupby("Model", as_index=False)
+        .agg(
+            Mean_MAE=("MAE", "mean"),
+            Mean_RMSE=("RMSE", "mean"),
+            Mean_R2=("R2", "mean"),
+            Mean_Directional_Accuracy=("Directional_Accuracy", "mean"),
+            RMSE_Std=("RMSE", "std"),
+        )
+        .sort_values("Mean_RMSE", ascending=True, ignore_index=True)
+    )
+    return summary
