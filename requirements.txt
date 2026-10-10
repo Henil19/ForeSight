@@ -3,6 +3,4 @@ numpy
 yfinance
 scikit-learn
 matplotlib
-seaborn
-tensorflow
 pytest
