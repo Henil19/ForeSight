@@ -1,5 +1,7 @@
 # ForeSight
 
+![CI](https://github.com/Henil19/ForeSight/actions/workflows/ci.yml/badge.svg)
+
 ForeSight is an educational machine-learning project for forecasting the closing price of the next available AAPL observation. It builds causal technical features from Yahoo Finance data, compares regression models with a naive persistence baseline, evaluates models chronologically, and produces a next-observation forecast.
 
 ## Overview
