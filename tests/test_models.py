@@ -3,12 +3,18 @@
 import numpy as np
 import pandas as pd
 import pytest
+import main as main_module
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.compose import TransformedTargetRegressor
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.pipeline import Pipeline
 
-from main import _fit_final_forecast_model, _select_best_trained_model
+from main import (
+    NAIVE_BASELINE_NAME,
+    _fit_final_forecast_model,
+    _forecast_selected_candidate,
+    _select_best_forecast_candidate,
+)
 from src.evaluation import (
     calculate_baseline_improvement,
     calculate_directional_accuracy,
@@ -26,6 +32,7 @@ from src.models import (
     build_mlp_scaled_target,
     build_random_forest,
     chronological_split,
+    chronological_train_validation_test_split,
     prepare_supervised_data,
     train_models,
 )
@@ -58,6 +65,8 @@ def test_prepare_supervised_data_shifts_target_and_does_not_mutate_input():
     assert y.iloc[0] == source["Close"].iloc[1]
     assert y.iloc[-1] == source["Close"].iloc[-1]
     assert X.index.equals(source.index[:-1])
+    np.testing.assert_array_equal(y.to_numpy(), source["Close"].iloc[1:].to_numpy())
+    assert source.index[-1] not in X.index
     assert y.name == "Target"
     pd.testing.assert_frame_equal(source, before)
 
@@ -80,6 +89,52 @@ def test_chronological_split_preserves_order_and_rejects_invalid_sizes():
     for invalid in (0, 1, -0.1, 1.1, float("nan")):
         with pytest.raises(ValueError, match="test_size"):
             chronological_split(X, y, invalid)
+
+
+def test_chronological_train_validation_test_split_boundaries_and_alignment():
+    X, y = prepare_supervised_data(synthetic_features(100))
+    X_train, X_validation, X_test, y_train, y_validation, y_test = (
+        chronological_train_validation_test_split(X, y)
+    )
+
+    assert len(X_train) + len(X_validation) + len(X_test) == len(X)
+    assert len(X_train) > len(X_validation) == len(X_test)
+    assert X_train.index.equals(y_train.index)
+    assert X_validation.index.equals(y_validation.index)
+    assert X_test.index.equals(y_test.index)
+    assert X_train.index[-1] < X_validation.index[0]
+    assert X_validation.index[-1] < X_test.index[0]
+    assert X_train.index.append(X_validation.index).append(X_test.index).equals(X.index)
+    pd.testing.assert_series_equal(y_train, y.loc[X_train.index])
+    pd.testing.assert_series_equal(y_validation, y.loc[X_validation.index])
+    pd.testing.assert_series_equal(y_test, y.loc[X_test.index])
+
+
+def test_chronological_train_validation_test_split_rejects_invalid_inputs():
+    X, y = prepare_supervised_data(synthetic_features(20))
+    with pytest.raises(ValueError, match="identical index"):
+        chronological_train_validation_test_split(X, y.set_axis(pd.RangeIndex(len(y))))
+    with pytest.raises(ValueError, match="chronologically ordered"):
+        chronological_train_validation_test_split(X.iloc[::-1], y.iloc[::-1])
+    with pytest.raises(ValueError, match="sum to less than 1"):
+        chronological_train_validation_test_split(X, y, validation_size=0.5, test_size=0.5)
+    with pytest.raises(ValueError, match="at least one row"):
+        chronological_train_validation_test_split(X.iloc[:2], y.iloc[:2])
+
+
+def test_preprocessing_and_target_scaling_fit_only_on_training_split():
+    X, y = prepare_supervised_data(synthetic_features(120))
+    X_train, X_validation, X_test, y_train, y_validation, y_test = (
+        chronological_train_validation_test_split(X, y)
+    )
+    model = build_mlp_scaled_target().fit(X_train, y_train)
+
+    np.testing.assert_allclose(
+        model.regressor_.named_steps["scaler"].mean_, X_train.mean().to_numpy()
+    )
+    assert model.transformer_.mean_[0] == pytest.approx(y_train.mean())
+    assert model.transformer_.mean_[0] != pytest.approx(y_validation.mean())
+    assert model.transformer_.mean_[0] != pytest.approx(y_test.mean())
 
 
 def test_all_models_build_train_and_predict():
@@ -147,16 +202,18 @@ def test_directional_accuracy_hand_example_including_zero_movement():
 def test_evaluation_metrics_and_model_comparison():
     class FixedPredictor:
         def predict(self, X):
-            return np.array([11.0, 9.0, 12.0])
+            return np.array([11.0, 13.0, 13.0])
 
     index = pd.RangeIndex(3)
     X_test = pd.DataFrame({"x": [1, 2, 3]}, index=index)
-    y_test = pd.Series([10.0, 10.0, 10.0], index=index)
-    previous = pd.Series([9.0, 11.0, 10.0], index=index)
+    y_test = pd.Series([10.0, 12.0, 14.0], index=index)
+    previous = pd.Series([9.0, 11.0, 14.0], index=index)
     metrics = evaluate_model(FixedPredictor(), X_test, y_test, previous)
     assert set(metrics) == {"MAE", "RMSE", "R2", "Directional_Accuracy"}
-    squared_errors = (np.array([11.0, 9.0, 12.0]) - y_test.to_numpy()) ** 2
-    assert metrics["RMSE"] ** 2 == pytest.approx(squared_errors.mean())
+    assert metrics["MAE"] == pytest.approx(1.0)
+    assert metrics["RMSE"] == pytest.approx(1.0)
+    assert metrics["R2"] == pytest.approx(0.625)
+    assert metrics["Directional_Accuracy"] == pytest.approx(2 / 3)
     assert all(np.isfinite(value) for value in metrics.values())
 
     table = compare_models(
@@ -167,6 +224,19 @@ def test_evaluation_metrics_and_model_comparison():
     assert list(table.columns) == ["Model", "MAE", "RMSE", "R2", "Directional_Accuracy"]
     assert table.iloc[0]["Model"] == "fixed"
     assert np.isfinite(table[["MAE", "RMSE", "R2", "Directional_Accuracy"]].to_numpy()).all()
+
+
+def test_evaluate_model_rejects_misaligned_previous_close_dates():
+    class FixedPredictor:
+        def predict(self, X):
+            return np.zeros(len(X))
+
+    index = pd.date_range("2024-01-01", periods=2, freq="B")
+    X = pd.DataFrame({"x": [1.0, 2.0]}, index=index)
+    y = pd.Series([3.0, 4.0], index=index)
+    previous = pd.Series([2.0, 3.0], index=index[::-1])
+    with pytest.raises(ValueError, match="identical indexes"):
+        evaluate_model(FixedPredictor(), X, y, previous)
 
 
 def test_compare_models_sorts_by_rmse():
@@ -258,21 +328,187 @@ def test_calculate_baseline_improvement_percentages_and_validation():
             calculate_baseline_improvement(model, zero_baseline)
 
 
-def test_forecast_model_selection_excludes_naive_baseline():
+def test_validation_model_selection_compares_trained_models_with_baseline():
     class TrainedModel:
         pass
 
     trained_models = {"Linear Regression": TrainedModel(), "MLP": TrainedModel()}
-    comparison = pd.DataFrame(
-        {
-            "Model": ["Naive Baseline", "Linear Regression", "MLP"],
-            "RMSE": [0.1, 2.0, 3.0],
-        }
-    )
+    baseline_best = pd.DataFrame({
+        "Model": [NAIVE_BASELINE_NAME, "Linear Regression", "MLP"],
+        "RMSE": [1.0, 2.0, 3.0],
+    })
+    assert _select_best_forecast_candidate(baseline_best, trained_models) == NAIVE_BASELINE_NAME
 
-    selected = _select_best_trained_model(comparison, trained_models)
+    trained_model_best = pd.DataFrame({
+        "Model": [NAIVE_BASELINE_NAME, "Linear Regression", "MLP"],
+        "RMSE": [2.0, 1.0, 3.0],
+    })
+    selected = _select_best_forecast_candidate(trained_model_best, trained_models)
     assert selected == "Linear Regression"
     assert selected in trained_models
+
+    tied = pd.DataFrame({
+        "Model": [NAIVE_BASELINE_NAME, "Linear Regression", "MLP"],
+        "RMSE": [1.0, 1.0, 3.0],
+    })
+    assert _select_best_forecast_candidate(tied, trained_models) == NAIVE_BASELINE_NAME
+
+
+def test_final_test_metrics_cannot_change_validation_selected_candidate(monkeypatch, tmp_path):
+    features = synthetic_features(150)
+    prices = pd.DataFrame(
+        {
+            "Open": features["Close"] - 0.1,
+            "High": features["Close"] + 0.5,
+            "Low": features["Close"] - 0.5,
+            "Close": features["Close"],
+            "Volume": features["Volume"],
+        },
+        index=features.index,
+    )
+    built_models = {name: [] for name in ("Linear Regression", "Random Forest", "MLP")}
+
+    class RecordingModel:
+        def __init__(self, name):
+            self.name = name
+            self.fit_index = None
+            self.fit_target = None
+
+        def fit(self, X, y):
+            self.fit_index = X.index.copy()
+            self.fit_target = y.copy()
+            return self
+
+        def predict(self, X):
+            return np.full(len(X), 250.0)
+
+    def make_builder(name):
+        def builder():
+            model = RecordingModel(name)
+            built_models[name].append(model)
+            return model
+        return builder
+
+    monkeypatch.setattr(main_module, "download_stock_data", lambda *args, **kwargs: prices)
+    monkeypatch.setattr(main_module, "create_features", lambda _prices: features)
+    monkeypatch.setattr(main_module, "OUTPUT_DIR", tmp_path)
+    monkeypatch.setattr(main_module, "_save_plots", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main_module, "build_linear_regression", make_builder("Linear Regression"))
+    monkeypatch.setattr(main_module, "build_random_forest", make_builder("Random Forest"))
+    monkeypatch.setattr(main_module, "build_mlp_scaled_target", make_builder("MLP"))
+    monkeypatch.setattr(
+        main_module,
+        "train_models",
+        lambda X, y: {
+            name: builder()
+            for name, builder in (
+                ("Linear Regression", main_module.build_linear_regression),
+                ("Random Forest", main_module.build_random_forest),
+                ("MLP", main_module.build_mlp_scaled_target),
+            )
+        },
+    )
+
+    development_indexes = []
+
+    def fake_walk_forward(models, X, y, previous_close, **kwargs):
+        development_indexes.append(X.index.copy())
+        assert X.index.equals(y.index)
+        assert X.index.equals(previous_close.index)
+        return pd.DataFrame({
+            "Split": [1], "Model": ["Naive Baseline"], "MAE": [1.0],
+            "RMSE": [1.0], "R2": [0.0], "Directional_Accuracy": [0.0],
+        })
+
+    monkeypatch.setattr(main_module, "walk_forward_validate", fake_walk_forward)
+    monkeypatch.setattr(
+        main_module,
+        "summarize_walk_forward_results",
+        lambda results: pd.DataFrame({"Model": ["Naive Baseline"], "Mean_RMSE": [1.0]}),
+    )
+
+    comparison_calls = []
+
+    def fake_compare(models, X, y, previous_close):
+        comparison_calls.append((set(models), X.index.copy(), y.index.copy(), previous_close.index.copy()))
+        if len(comparison_calls) == 1:
+            # Linear Regression wins validation RMSE.
+            rows = [
+                ("Naive Baseline", 2.0),
+                ("Linear Regression", 1.0),
+                ("Random Forest", 3.0),
+                ("MLP", 4.0),
+            ]
+        else:
+            # Deliberately make the final-test result favor the baseline.
+            rows = [("Linear Regression", 100.0), ("Naive Baseline", 0.01)]
+        return pd.DataFrame([
+            {
+                "Model": name, "MAE": rmse, "RMSE": rmse, "R2": 0.0,
+                "Directional_Accuracy": 0.0,
+            }
+            for name, rmse in rows
+        ])
+
+    monkeypatch.setattr(main_module, "compare_models", fake_compare)
+    main_module.main()
+
+    X, y = prepare_supervised_data(features)
+    X_train, X_validation, X_test, y_train, y_validation, y_test = (
+        chronological_train_validation_test_split(X, y)
+    )
+    X_development = pd.concat([X_train, X_validation])
+    y_development = pd.concat([y_train, y_validation])
+
+    assert comparison_calls[0][0] == {"Linear Regression", "Random Forest", "MLP"}
+    assert comparison_calls[0][1].equals(X_validation.index)
+    assert comparison_calls[0][2].equals(y_validation.index)
+    assert comparison_calls[0][3].equals(y_validation.index)
+    assert comparison_calls[1][0] == {"Linear Regression"}
+    assert comparison_calls[1][1].equals(X_test.index)
+    assert comparison_calls[1][2].equals(y_test.index)
+    assert comparison_calls[1][3].equals(y_test.index)
+    assert development_indexes[0].equals(X_development.index)
+    assert not development_indexes[0].intersection(X_test.index).size
+
+    forecast_text = (tmp_path / "forecast.txt").read_text(encoding="utf-8")
+    assert "Selected Forecast Candidate (validation RMSE): Linear Regression" in forecast_text
+    assert built_models["Linear Regression"][-1].fit_index.equals(X.index)
+    pd.testing.assert_series_equal(built_models["Linear Regression"][-1].fit_target, y)
+
+
+def test_selected_forecast_uses_naive_previous_close_or_refits_trained_model():
+    instances = []
+
+    class RecordingModel:
+        def fit(self, X, y):
+            self.fit_index = X.index.copy()
+            self.fit_target = y.copy()
+            return self
+
+        def predict(self, X):
+            return np.full(len(X), 250.0)
+
+    def build_recording_model():
+        instance = RecordingModel()
+        instances.append(instance)
+        return instance
+
+    features = synthetic_features(40)
+    X, y = prepare_supervised_data(features)
+    baseline_model, baseline_forecast = _forecast_selected_candidate(
+        NAIVE_BASELINE_NAME, {}, X, y, features,
+    )
+    assert baseline_model is None
+    assert baseline_forecast == pytest.approx(features["Close"].iloc[-1])
+
+    forecast_model, forecast = _forecast_selected_candidate(
+        "Recording", {"Recording": build_recording_model}, X, y, features,
+    )
+    assert forecast_model is instances[0]
+    assert forecast_model.fit_index.equals(X.index)
+    pd.testing.assert_series_equal(forecast_model.fit_target, y)
+    assert forecast == pytest.approx(250.0)
 
 
 def test_final_forecast_refit_is_fresh_and_uses_all_labeled_rows():

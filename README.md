@@ -17,18 +17,18 @@ Yahoo Finance data ingestion
     → chronological data cleaning
     → feature engineering
     → supervised target creation
-    → chronological holdout evaluation
-    → naive persistence baseline
-    → five-fold walk-forward validation
-    → model comparison
-    → best trained-model selection
+    → chronological train / validation / final-test split
+    → candidate training and validation comparison (including naive baseline)
+    → five-fold expanding-window validation on development data
+    → validation-based candidate selection
+    → selected-candidate final-test evaluation
     → final refit on all labeled observations
     → next-observation forecast
 ```
 
 ## Data
 
-The application downloads daily OHLCV data (Open, High, Low, Close, Volume) from Yahoo Finance using `yfinance`. `main.py` requests AAPL with the rolling `5y` period and `auto_adjust=False`. The period is relative to the run date; the repository does not contain a bundled fixed historical dataset.
+The application downloads daily OHLCV data (Open, High, Low, Close, Volume) from Yahoo Finance using `yfinance`. `main.py` requests AAPL with the rolling `5y` period and `auto_adjust=False`. The period is relative to the run date. A separate saved AAPL snapshot is retained under `experiments/data/` in the current working tree for offline development experiments; `main.py` does not use that snapshot. The snapshot is not part of the proposed source-only release.
 
 Rows are sorted chronologically. Duplicate dates keep the last downloaded row, invalid dates are removed, and rows with missing or non-numeric required OHLCV values are dropped. A live run requires network access to Yahoo Finance. The `Close` and `Volume` fields are used to create features.
 
@@ -78,15 +78,17 @@ The underlying `MLPRegressor` has one hidden layer with 32 ReLU units, uses the 
 
 ## Naive Baseline
 
-The naive baseline predicts the next `Close` as the previous actual `Close` for that target row. It is not trained; it serves as a persistence benchmark and is included in evaluation. It is excluded from final trained-model selection.
+The naive baseline predicts the next `Close` as the previous actual `Close` for that target row. It is not trained; it serves as a persistence benchmark and is included in evaluation. It is not a trained model, but it remains eligible as a forecast candidate. The validation-RMSE rule selects it when it ties or outperforms the best trained model.
 
-For directional accuracy, the baseline always predicts zero movement relative to the previous close. It therefore counts as directionally correct only when the actual close is unchanged. Its directional-accuracy score is near zero by construction and should be interpreted with that caveat.
+For directional accuracy, the baseline always predicts zero movement relative to the previous close. It scores correctly only when the actual close is unchanged, so its score equals the share of unchanged closes and is typically near zero for daily prices. Interpret that score as a consequence of the metric and baseline definition, not as a price-level error measure.
 
 ## Evaluation
 
-### Chronological Holdout
+### Chronological Train, Validation, and Final Test
 
-The labeled observations are divided into an 80/20 chronological split with no shuffling. The latest 20% is the holdout test set. Models are fitted only on the earlier training rows and compared on the same held-out rows.
+The labeled observations are divided chronologically into 60% training, 20% validation, and 20% final test data by default. There is no shuffling. Candidate regressors are fitted on the training portion only and compared with the naive baseline on validation data. The validation set determines which candidate is selected; the final test set is reserved for one evaluation of that selected approach. Before final-test evaluation, a selected trained model is freshly refitted using the combined training and validation data. The final test does not determine model selection.
+
+The comparison written to `outputs/model_comparison.csv` reports validation metrics for all trained candidates and the naive baseline. `outputs/final_test_comparison.csv` reports final-test metrics for the selected candidate and the naive baseline.
 
 ### Metrics
 
@@ -99,83 +101,102 @@ The labeled observations are divided into an 80/20 chronological split with no s
 
 Directional accuracy compares the signs of `(actual Close − previous Close)` and `(predicted Close − previous Close)`. A zero actual movement matches only a zero predicted movement.
 
+R² can be negative when predictions are worse than predicting the evaluation-set mean. Price-level R² can also look high when prices trend over time, so it should be read alongside RMSE and the previous-close baseline; it is not evidence by itself that a model beats that baseline.
+
 ## Walk-Forward Validation
 
-The application runs five sequential chronological folds with expanding training windows. In `main.py`, the initial training size is explicitly set to:
+The application runs five sequential chronological folds with expanding training windows on the pre-test development data (training plus validation). In `main.py`, the initial training size is explicitly set to:
 
 ```python
-min_train_size = max(100, len(X) // 4)
+min_train_size = max(100, len(X_development) // 4)
 ```
 
-Each test window occurs after its training window, and later training windows include additional earlier observations. The evaluation helper clones each supplied estimator and fits a fresh clone for every fold. Preprocessing and target transformations are fitted as part of that fold's model fit, using only the fold's training data. The naive baseline is evaluated separately on each fold using that fold's previous closes.
+Each test window occurs after its training window, and later training windows include additional earlier observations. The evaluation helper clones each supplied estimator and fits a fresh clone for every fold. Feature preprocessing and the MLP target transformation are fitted as part of that fold's model fit, using only that fold's training data. The naive baseline is evaluated separately on each fold using that fold's previous closes. The final test observations are not included in walk-forward validation.
 
-Walk-forward results are reported separately. The final model is selected by holdout RMSE, not by the walk-forward summary. Walk-forward evaluation provides multiple chronological historical comparisons but does not guarantee future performance.
+Walk-forward results are reported separately and are not used to select the forecasting candidate. This evaluation provides multiple chronological comparisons within development data but does not guarantee future performance.
+
+## Phase 3 Development Experiments
+
+These experiments were run on a saved AAPL Yahoo Finance snapshot, separate from the production outputs. The snapshot, raw download, and provenance are local artifacts under `experiments/data/` and are not included in the public source release. The cleaned data uses the project's existing cleaning: flatten yfinance OHLCV columns when needed, normalize OHLCV names, parse dates, sort, keep the last duplicate date, coerce OHLCV fields to numeric, and drop invalid or incomplete rows.
+
+The added feature candidate uses only information through its forecast origin: `Return_Lag_1` and `Return_Lag_5` are daily returns shifted by one and five observations; `Momentum_5` and `Momentum_20` are `Close[t] / Close[t-k] - 1`; and `Volume_Change_1` is the one-observation percent change in volume. The existing `Volatility` feature is already a 20-observation rolling standard deviation of returns, so no duplicate rolling-volatility feature was added. The five new features were tested together as one small feature set, not tuned individually. All candidates were restricted to their common dates and target rows after the additional 20-observation warm-up.
+
+Three price baselines were compared:
+
+- **Previous Close:** predict `Close[t]` for the next observation.
+- **Expanding Drift:** predict `Close[t] + (Close[t] - Close[first]) / (n - 1)`, where the first and current closes and all `n` observed closes are available by origin `t`. The estimate updates using history available through each forecast origin.
+- **5-day Moving Average:** predict the mean of the last five closes through and including `Close[t]`.
+
+The return-target candidates predict `(Close[t+1] / Close[t]) - 1`. Their price forecasts are converted back with `Close[t] * (1 + predicted_return)`. Zero predicted return is exactly the previous-close baseline. Return-target metrics use return units, while price and converted-return candidates are evaluated on the same price target and dates.
+
+The development experiments compared the existing models with previous-close persistence, an expanding-drift baseline, and a trailing moving-average baseline. They also examined a small causal feature set and price-versus-return targets using common evaluation dates. Machine-learning candidates did not consistently outperform the simple baselines across development validation and folds. These results are qualitative here; the local CSV/JSON reports are not included in the public source release. The reserved forecasting final test was not used for these development decisions and remains separate.
+
+The local results also include a preliminary run with a target-construction error in its `causal_plus` candidates. That run is invalid and is not used for the findings above. Snapshot files and all generated experiment reports—including preliminary and corrected results—remain local and are not part of the public source release. The downloader refuses to overwrite an existing snapshot, and the runner refuses to overwrite existing result files.
+
+## Offline Reproducibility and Phase 4 Reports
+
+The development experiment runner uses only the saved cleaned snapshot at `experiments/data/aapl_5y_clean.csv`; it never downloads market data. A source-only checkout does not include a snapshot, so offline execution requires a compatible saved snapshot and its metadata at `experiments/data/`. To create a local snapshot, run the downloader once (this step requires network access):
+
+```powershell
+python experiments/download_phase3_data.py
+```
+
+The downloader refuses to overwrite existing snapshot files. A fresh download is a different snapshot and will not reproduce the saved-snapshot results exactly. With a compatible snapshot in place, run the experiment explicitly in offline mode:
+
+```powershell
+python -m experiments.phase3 --offline
+```
+
+The default report directory is `experiments/results/phase4_offline/`. Reports and plots are generated locally and are not included in the public source release. A run creates validation and fold CSVs, comparison and fold JSON files, development-only prediction rows, metadata, and plots for actual-versus-predicted values, prediction errors, and fold RMSE. The runner refuses to proceed if its report files already exist, so choose a new empty destination with `--output-dir` before rerunning. It checks the saved data against the SHA-256 in its metadata and stops on a mismatch or malformed data. The Phase 3 corrected results remain separate and are not overwritten.
+
+Phase 4 records development validation and fold metrics, model configuration, random seeds, software versions, and snapshot provenance. Reports retain any MLP convergence-warning flags; convergence is not guaranteed. The offline runner reserves the forecasting final test and does not score or display its results.
+
+The qualitative findings above reflect the verified saved-snapshot development experiments. An offline run generates new local reports; it does not download market data or evaluate the reserved forecasting final test. Exact reproduction of the saved-snapshot analysis requires the same dataset and configuration recorded in the locally generated metadata.
+
+The repository records Yahoo Finance via `yfinance` as the snapshot source, but contains no separate data license or redistribution permission note. Verify the applicable terms before publishing downloaded CSVs or data-derived charts. A source-only release can omit `experiments/data/` and the generated experiment reports; users would then need a compatible local snapshot before using offline experiments. Downloading a fresh snapshot requires network access and will not reproduce the saved-snapshot results exactly.
 
 ## Model Selection and Final Forecast
 
-The final trained model is selected by the lowest RMSE on the chronological holdout comparison. Only trained models are eligible; the naive baseline is excluded. The selected model is freshly instantiated and refitted on all available labeled observations before forecasting. The forecast uses the latest available feature row, whose next-observation target is unknown.
+The forecasting candidate is selected by the lowest validation RMSE across Linear Regression, Random Forest, MLP, and the naive baseline. If no trained model has a lower validation RMSE than the baseline, the baseline is selected (ties favor the baseline). The selected candidate's final-test metrics are reported separately and do not change the selection. After final-test evaluation, a selected trained model is freshly instantiated and refitted on all available labeled observations before forecasting. If the baseline is selected, the forecast is the latest observed `Close`. The forecast uses the latest available feature row, whose next-observation target is unknown.
 
 The forecast date is a Monday–Friday weekday approximation. Exchange holidays and market-specific trading calendars are not modeled.
 
-## Current Results
+## Development Findings
 
-The numerical results below correspond to the verified run used for this README. They describe one run and are not guarantees of future performance. The application continues to write generated result files to `outputs/` when it runs.
-
-### Holdout Comparison
-
-| Model | MAE | RMSE | R² | Directional Accuracy |
-|---|---:|---:|---:|---:|
-| Naive Baseline | 3.349005 | 4.703769 | 0.972312 | 0.000000 |
-| Linear Regression | 3.360157 | 4.729820 | 0.972004 | 0.521327 |
-| MLP | 6.909706 | 8.458911 | 0.910457 | 0.483412 |
-| Random Forest | 21.571111 | 27.913769 | 0.024917 | 0.492891 |
-
-### Walk-Forward Summary
-
-| Model | Mean MAE | Mean RMSE | Mean R² | Mean Directional Accuracy | RMSE Std |
-|---|---:|---:|---:|---:|---:|
-| Naive Baseline | 2.652242 | 3.738021 | 0.957086 | 0.001258 | 1.126652 |
-| Linear Regression | 2.818250 | 3.900445 | 0.952714 | 0.487437 | 1.032152 |
-| MLP | 5.491379 | 6.805367 | 0.850015 | 0.486084 | 1.713111 |
-| Random Forest | 13.585605 | 17.135303 | 0.289863 | 0.492341 | 11.365708 |
-
-In this run, the naive baseline has the lowest mean walk-forward RMSE. Linear Regression is the best trained ML model by mean walk-forward RMSE. The target-scaled MLP improved substantially over the raw-target MLP in the controlled experiment, but remains behind the naive baseline and Linear Regression in these results. Random Forest performs worse than those two approaches in the reported comparisons. The results do not show that the ML models outperform the naive baseline overall.
-
-The stored example forecast is for AAPL: Linear Regression was selected, with a predicted close of **$336.80** and an approximated forecast date of **2026-10-12**. This is a run-specific result, not a prediction guarantee.
-
-## Visual Results
-
-The selected charts below are included in `assets/` for README display. Running the application continues to generate these plots under `outputs/`.
-
-![Historical closing price](assets/historical_close.png)
-
-![Technical indicators](assets/technical_indicators.png)
-
-![Model predictions](assets/model_predictions.png)
+The saved-snapshot development experiments tested price and return targets, a limited set of causal features, and simple price baselines alongside the machine-learning candidates. The simple baselines remained competitive; machine-learning candidates did not consistently outperform them across validation and expanding-window folds. These are development findings, not a claim of future performance. The reserved forecasting final test remains separate and is not reported here. MLP training can emit convergence warnings, which are retained rather than hidden.
 
 ## Generated Outputs
 
-The application writes these files under `outputs/`:
+The application generates these files under `outputs/` when run. `.gitignore` excludes the contents of this directory, so they are not included in a source-only checkout and users must generate them locally. `outputs/final_test_comparison.csv` contains the selected candidate's final-test evaluation when the production application runs; this README does not publish those metrics.
 
 | File | Description |
 |---|---|
-| `outputs/model_comparison.csv` | Holdout metrics for trained models and the naive baseline, including RMSE improvement versus the baseline. |
+| `outputs/model_comparison.csv` | Validation metrics for all trained candidates and the naive baseline, including RMSE improvement versus the baseline and the selected candidate. |
+| `outputs/final_test_comparison.csv` | Final-test metrics for the selected candidate and naive baseline; not used for selection. |
 | `outputs/walk_forward_results.csv` | Metrics for each model and individual walk-forward fold. |
 | `outputs/walk_forward_summary.csv` | Mean metrics and RMSE standard deviation across folds. |
-| `outputs/forecast.txt` | Selected trained model, forecast date, predicted close, and educational disclaimer. |
+| `outputs/forecast.txt` | Selected forecast candidate and method, forecast date, predicted close, and educational disclaimer. |
 | `outputs/historical_close.png` | Historical closing-price plot. |
 | `outputs/technical_indicators.png` | Closing price with MA20, MA50, and MA200. |
-| `outputs/model_predictions.png` | Actual and predicted close values for holdout target dates. |
+| `outputs/model_predictions.png` | Actual final-test closes, selected candidate predictions when trained, and naive baseline predictions. |
 
 ## Project Structure
 
 ```text
 ForeSight/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
 ├── main.py
 ├── requirements.txt
 ├── README.md
 ├── .gitignore
-├── outputs/
+├── experiments/                    # source files proposed; data/reports are local artifacts
+│   ├── download_phase3_data.py
+│   ├── phase3.py
+│   ├── data/                       # required locally for offline runs; excluded from source-only release
+│   └── results/                    # generated locally; excluded from source-only release
+├── outputs/                        # generated by main.py; ignored by Git
 ├── src/
 │   ├── data.py
 │   ├── features.py
@@ -184,7 +205,8 @@ ForeSight/
 │   └── forecasting.py
 └── tests/
     ├── test_pipeline.py
-    └── test_models.py
+    ├── test_models.py
+    └── test_phase3_experiments.py
 ```
 
 - `main.py` orchestrates data retrieval, model training and evaluation, walk-forward reporting, final refitting, forecasting, and output generation.
@@ -231,12 +253,12 @@ python -m pytest -q
 ## Limitations
 
 - The application is currently configured for AAPL.
-- Data is downloaded from a rolling five-year window, not from a bundled fixed dataset.
+- The production application downloads a rolling five-year window; the separate saved research snapshot supports offline experiments.
 - The target is the next available observation, not a guaranteed next calendar day.
 - The displayed forecast date uses a weekday approximation and does not account for exchange holidays.
 - Historical performance does not guarantee future results.
 - A previous-close persistence baseline can be difficult to beat for price-level forecasting.
-- The baseline's directional accuracy is near zero by construction because the baseline predicts no movement relative to the previous close.
+- The previous-close baseline's directional-accuracy score equals the fraction of unchanged closes; it is not a measure of its price-level accuracy.
 - Technical indicators do not eliminate market uncertainty.
 
 ## Disclaimer

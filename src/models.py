@@ -98,3 +98,45 @@ def chronological_split(
         raise ValueError("test_size must leave at least one row in both splits.")
     split_at = len(X) - test_count
     return X.iloc[:split_at].copy(), X.iloc[split_at:].copy(), y.iloc[:split_at].copy(), y.iloc[split_at:].copy()
+
+
+def chronological_train_validation_test_split(
+    X: pd.DataFrame,
+    y: pd.Series,
+    validation_size: float = 0.2,
+    test_size: float = 0.2,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
+    """Split aligned observations into chronological train, validation, and test sets.
+
+    Validation and test sizes are fractions of the full dataset. The input row
+    order is preserved; the latest rows form the final test set, and the rows
+    immediately before them form the validation set.
+    """
+    if not isinstance(X, pd.DataFrame) or not isinstance(y, pd.Series):
+        raise TypeError("X must be a DataFrame and y must be a Series.")
+    if len(X) != len(y) or not X.index.equals(y.index):
+        raise ValueError("X and y must have the same length and identical index.")
+    if not X.index.is_monotonic_increasing or X.index.has_duplicates:
+        raise ValueError("X and y indexes must be unique and chronologically ordered.")
+    for name, size in (("validation_size", validation_size), ("test_size", test_size)):
+        if isinstance(size, bool) or not isinstance(size, (int, float)) or not 0 < size < 1:
+            raise ValueError(f"{name} must be a number strictly between 0 and 1.")
+    if validation_size + test_size >= 1:
+        raise ValueError("validation_size and test_size must sum to less than 1.")
+
+    validation_count = int(len(X) * validation_size)
+    test_count = int(len(X) * test_size)
+    train_count = len(X) - validation_count - test_count
+    if min(train_count, validation_count, test_count) < 1:
+        raise ValueError("Dataset must leave at least one row in each chronological split.")
+
+    validation_start = train_count
+    test_start = train_count + validation_count
+    return (
+        X.iloc[:validation_start].copy(),
+        X.iloc[validation_start:test_start].copy(),
+        X.iloc[test_start:].copy(),
+        y.iloc[:validation_start].copy(),
+        y.iloc[validation_start:test_start].copy(),
+        y.iloc[test_start:].copy(),
+    )
